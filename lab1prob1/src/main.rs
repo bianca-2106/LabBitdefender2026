@@ -4,7 +4,8 @@ use std::path::Path;
 use zip::ZipArchive;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let zip_path = Path::new("/home/bia/Desktop/test.zip");
+    let args: Vec<String> = std::env::args().collect();
+    let zip_path = Path::new(&args[1]);
     let file = File::open(&zip_path)?;
     let reader = BufReader::new(file);
 
