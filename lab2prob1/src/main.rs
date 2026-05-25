@@ -1,11 +1,27 @@
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub const PROTOCOL_VERSION: i32 = 1;
+const INT_MAX: i32 = 2147483647;
+const INT_MIN: i32 = -2147483648;
+
+macro_rules! MAX {
+    ($a:expr, $b:expr) => { if $a > $b { $a } else { $b } };
+}
+macro_rules! MIN {
+    ($a:expr, $b:expr) => { if $a < $b { $a } else { $b } };
+}
+macro_rules! ABS {
+    ($a:expr) => { if $a < 0 { -$a } else { $a } };
+}
+macro_rules! IDX {
+    ($x:expr, $y:expr, $width:expr) => { (($y) * ($width) + ($x)) as usize };
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketMessage {
@@ -129,6 +145,105 @@ pub struct ErrorArgs {
     pub fatal: bool,
 }
 
+fn bresenham_line(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    let mut points: Vec<(i32, i32)> = Vec::new();
+    let dx: i32 = ABS!(x1 - x0);
+    let dy: i32 = -ABS!(y1 - y0);
+    let sx: i32 = if x0 < x1 { 1 } else { -1 };
+    let sy: i32 = if y0 < y1 { 1 } else { -1 };
+    let mut err: i32 = dx + dy;
+    let mut x: i32 = x0;
+    let mut y: i32 = y0;
+    
+    loop {
+        points.push((x, y));
+        if x == x1 && y == y1 { 
+            break; 
+        }
+        let e2: i32 = 2 * err;
+        if e2 >= dy { 
+            err += dy; 
+            x += sx; 
+        }
+        if e2 <= dx { 
+            err += dx; 
+            y += sy; 
+        }
+    }
+    return points;
+}
+
+fn bfs_next_step(start_x: i32, start_y: i32, target_x: i32, target_y: i32, width: i32, height: i32, walls: &Vec<(i32, i32)>) -> Option<(i32, i32)> {
+    let grid_size: usize = (width * height) as usize;
+    let mut visited: Vec<bool> = vec![false; grid_size];
+    let mut parent_x: Vec<i32> = vec![-1; grid_size];
+    let mut parent_y: Vec<i32> = vec![-1; grid_size];
+
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    
+    queue.push_back((start_x, start_y));
+    visited[IDX!(start_x, start_y, width)] = true;
+    parent_x[IDX!(start_x, start_y, width)] = start_x;
+    parent_y[IDX!(start_x, start_y, width)] = start_y;
+    
+    let dx: [i32; 8] = [3, 0, 0, -3, 3, 3, -3, -3];
+    let dy: [i32; 8] = [0, -3, 3, 0, 3, -3, 3, -3];
+
+    while !queue.is_empty() {
+        let curr = queue.pop_front().unwrap();
+        let cx = curr.0;
+        let cy = curr.1;
+
+        if ABS!(cx - target_x) <= 3 && ABS!(cy - target_y) <= 3 {
+            let mut path_x = cx;
+            let mut path_y = cy;
+            
+            while parent_x[IDX!(path_x, path_y, width)] != start_x || parent_y[IDX!(path_x, path_y, width)] != start_y {
+                let px = parent_x[IDX!(path_x, path_y, width)];
+                let py = parent_y[IDX!(path_x, path_y, width)];
+                path_x = px;
+                path_y = py;
+            }
+            return Some((path_x, path_y));
+        }
+        
+        for i in 0..8 {
+            let nx = cx + dx[i];
+            let ny = cy + dy[i];
+            
+            let in_bounds = nx >= 1 && nx < width - 1 && ny >= 1 && ny < height - 1;
+            if in_bounds {
+                let idx = IDX!(nx, ny, width);
+                if !visited[idx] {
+                    let mut is_wall = false;
+                    for w in 0..walls.len() {
+                        if walls[w].0 == nx && walls[w].1 == ny {
+                            is_wall = true;
+                            break;
+                        }
+                    }
+                    
+                    if !is_wall {
+                        visited[idx] = true;
+                        parent_x[idx] = cx;
+                        parent_y[idx] = cy;
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+        }
+    }
+    return None;
+}
+
+fn get_user_input(prompt: &str) -> String {
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    return input.trim().to_string();
+}
+
 async fn send_command<
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 >(
@@ -140,7 +255,7 @@ async fn send_command<
         .send(Message::Text(msg_deserialized.into()))
         .await
         .context("send message")?;
-    Ok(())
+    return Ok(());
 }
 
 #[tokio::main]
@@ -151,12 +266,14 @@ async fn main() {
 
     println!("Connected to server");
 
-    let mut my_player_id: Option<i32> = None;
+    let mut my_player_id: i32 = -1;
     let mut map_width: i32 = 0;
     let mut map_height: i32 = 0;
+    let mut walls_cache: Vec<(i32, i32)> = Vec::new();
+    let mut last_known_enemies: HashMap<i32, (i32, i32)> = HashMap::new();
 
-    while let Some(msg) = read.next().await {
-        let msg = msg.unwrap();
+    while let Some(msg_result) = read.next().await {
+        let msg = msg_result.unwrap();
 
         let text = match msg {
             Message::Text(text) => text,
@@ -164,23 +281,16 @@ async fn main() {
                 write.send(Message::Pong(payload)).await.unwrap();
                 continue;
             }
-            Message::Pong(_) => {
-                println!("pong");
-                continue;
-            }
-            Message::Binary(_) => {
-                println!("Warning: binary message ignored");
-                continue;
-            }
+            Message::Pong(_) => continue,
+            Message::Binary(_) | Message::Frame(_) => continue,
             Message::Close(frame) => {
                 println!("Connection closed: {frame:?}");
                 break;
             }
-            Message::Frame(_) => continue,
         };
 
         let message: WebSocketMessage = match serde_json::from_str(&text) {
-            Ok(msg) => msg,
+            Ok(m) => m,
             Err(e) => {
                 println!("Error parsing message: {e}");
                 continue;
@@ -189,7 +299,6 @@ async fn main() {
 
         match message.command {
             Command::Hello => {
-                println!("Received HELLO. Sending LOGIN for Bianca...");
                 send_command(
                     &mut write,
                     WebSocketMessage {
@@ -199,133 +308,234 @@ async fn main() {
                             "name": "Bianca"
                         }),
                     },
-                )
-                .await
-                .unwrap();
+                ).await.unwrap();
             }
             
             Command::Login => panic!("Server should not send LOGIN!"),
             
             Command::Ready => {
-                println!("Authentication successful. Sending PRACTICE command...");
-                send_command(
-                    &mut write,
-                    WebSocketMessage {
-                        command: Command::Practice,
-                        args: json!({}),
-                    },
-                )
-                .await
-                .unwrap();
+                println!("\n--- MATCH SETUP ---");
+                let mode = get_user_input("Choose mode - (P)ractice or (C)hallenge? ");
+                
+                if mode.to_uppercase().starts_with('C') {
+                    send_command(
+                        &mut write,
+                        WebSocketMessage {
+                            command: Command::Challenge,
+                            args: json!({
+                                "ranked": true
+                            }),
+                        },
+                    ).await.unwrap();
+                } else {
+                    let id_input = get_user_input("Choose Player ID - (0) Top, (1) Bottom, or (Enter) Any: ");
+                    let mut args = json!({});
+                    
+                    if id_input == "0" {
+                        args["my_id"] = json!(0);
+                    } else if id_input == "1" {
+                        args["my_id"] = json!(1);
+                    }
+                    
+                    send_command(
+                        &mut write,
+                        WebSocketMessage {
+                            command: Command::Practice,
+                            args,
+                        },
+                    ).await.unwrap();
+                }
             }
             
             Command::StartMatch => {
-                println!("MATCH STARTING!");
                 let match_data: StartMatchArgs = serde_json::from_value(message.args).unwrap();
                 
-                println!("Match generated successfully! Match ID: {}", match_data.match_id);
+                println!("Match ID: {}", match_data.match_id);
                 
-                my_player_id = Some(match_data.your_player_id);
+                my_player_id = match_data.your_player_id;
                 map_width = match_data.config.width;
                 map_height = match_data.config.height;
+                
+                walls_cache.clear();
+                for i in 0..match_data.state.walls.len() {
+                    walls_cache.push((match_data.state.walls[i].x, match_data.state.walls[i].y));
+                }
             }
 
             Command::StartTurn => {
                 let turn_data: StartTurnArgs = serde_json::from_value(message.args).unwrap();
-                println!("--- Turn {} ---", turn_data.turn);
 
-                if let Some(player_id) = my_player_id {
-                    let my_heroes: Vec<_> = turn_data.state.heroes.iter().filter(|h| h.owner_id == player_id).collect();
-                    let enemy_heroes: Vec<_> = turn_data.state.heroes.iter().filter(|h| h.owner_id != player_id).collect();
-
-                    for hero in my_heroes {
-                        let mut closest_enemy = None;
-                        let mut min_dist = i32::MAX;
+                if my_player_id != -1 {
+                    let mut my_heroes: Vec<Hero> = Vec::new();
+                    let mut enemy_heroes: Vec<Hero> = Vec::new();
+                    
+                    for i in 0..turn_data.state.heroes.len() {
+                        let h = &turn_data.state.heroes[i];
+                        if h.owner_id == my_player_id {
+                            my_heroes.push(h.clone());
+                        } else {
+                            enemy_heroes.push(h.clone());
+                            last_known_enemies.insert(h.id, (h.x, h.y));
+                        }
+                    }
+                    
+                    let mut primary_target: Option<(i32, i32)> = None;
+                    
+                    if my_heroes.len() > 0 {
+                        let first_hero = &my_heroes[0];
+                        let mut min_dist: i32 = INT_MAX;
                         
-                        for enemy in &enemy_heroes {
-                            let dist = (hero.x - enemy.x).abs().max((hero.y - enemy.y).abs());
+                        for (_id, pos) in &last_known_enemies {
+                            let dist_x = ABS!(first_hero.x - pos.0);
+                            let dist_y = ABS!(first_hero.y - pos.1);
+                            let dist = MAX!(dist_x, dist_y);
+                            
                             if dist < min_dist {
                                 min_dist = dist;
-                                closest_enemy = Some(enemy);
+                                primary_target = Some(*pos);
                             }
                         }
+                    }
 
-                        if hero.cooldown == 0 && closest_enemy.is_some() {
-                            let target = closest_enemy.unwrap();
-                            println!("Hero {} SHOOTS at enemy at {}, {}", hero.id, target.x, target.y);
-                            
-                            send_command(
-                                &mut write,
-                                WebSocketMessage {
-                                    command: Command::Shoot,
-                                    args: json!({
-                                        "hero_id": hero.id,
-                                        "x": target.x,
-                                        "y": target.y
-                                    }),
-                                },
-                            ).await.unwrap();
-                            continue;
-                        }
+                    for i in 0..my_heroes.len() {
+                        let hero = &my_heroes[i];
+                        let mut acted: bool = false;
+                        let comment: Option<&str> = None;
 
-                        let possible_moves = [
-                            (hero.x, hero.y + 3),
-                            (hero.x + 3, hero.y + 3),
-                            (hero.x - 3, hero.y + 3),
-                            (hero.x + 3, hero.y),
-                            (hero.x - 3, hero.y),
-                            (hero.x + 3, hero.y - 3),
-                            (hero.x - 3, hero.y - 3),
-                            (hero.x, hero.y - 3),
-                        ];
+                        if let Some(target) = primary_target {
+                            let ex = target.0;
+                            let ey = target.1;
 
-                        let mut best_move = None;
-                        let mut best_dist = i32::MAX;
-
-                        for &(tx, ty) in possible_moves.iter() {
-                            let in_bounds = tx >= 1 && tx < map_width - 1 && ty >= 1 && ty < map_height - 1;
-                            
-                            if in_bounds {
-                                let hit_wall = turn_data.state.walls.iter().any(|w| w.x == tx && w.y == ty);
+                            if hero.cooldown == 0 {
+                                let line = bresenham_line(hero.x, hero.y, ex, ey);
+                                let mut hit_wall = false;
                                 
-                                if !hit_wall {
-                                    if let Some(target) = closest_enemy {
-                                        let dist_to_target = (tx - target.x).abs().max((ty - target.y).abs());
-                                        if dist_to_target < best_dist {
-                                            best_dist = dist_to_target;
-                                            best_move = Some((tx, ty));
+                                for p in 0..line.len() {
+                                    for w in 0..walls_cache.len() {
+                                        if walls_cache[w].0 == line[p].0 && walls_cache[w].1 == line[p].1 {
+                                            hit_wall = true;
+                                            break;
                                         }
-                                    } else {
-                                        best_move = Some((tx, ty));
-                                        break; 
+                                    }
+                                    if hit_wall {
+                                        break;
                                     }
                                 }
-                            }
-                        }
 
-                        if let Some((target_x, target_y)) = best_move {
-                            println!("Hero {} moves to {},{}", hero.id, target_x, target_y);
-                            send_command(
-                                &mut write,
-                                WebSocketMessage {
-                                    command: Command::Move,
-                                    args: json!({
-                                        "hero_id": hero.id,
-                                        "x": target_x,
-                                        "y": target_y
-                                    }),
-                                },
-                            ).await.unwrap();
+                                if !hit_wall {
+                                    send_command(
+                                        &mut write,
+                                        WebSocketMessage {
+                                            command: Command::Shoot,
+                                            args: json!({
+                                                "hero_id": hero.id,
+                                                "x": ex,
+                                                "y": ey,
+                                                "comment": comment
+                                            }),
+                                        },
+                                    ).await.unwrap();
+                                    acted = true;
+                                }
+                            }
+
+                            if !acted {
+                                let ideal_distance = if hero.cooldown == 0 { 8 } else { 12 };
+                                
+                                let possible_moves: [(i32, i32); 8] = [
+                                    (hero.x, hero.y + 3), (hero.x + 3, hero.y + 3), (hero.x - 3, hero.y + 3),
+                                    (hero.x + 3, hero.y), (hero.x - 3, hero.y),
+                                    (hero.x + 3, hero.y - 3), (hero.x - 3, hero.y - 3), (hero.x, hero.y - 3),
+                                ];
+
+                                let mut best_move: Option<(i32, i32)> = None;
+                                let mut best_score: i32 = INT_MIN;
+
+                                for m in 0..8 {
+                                    let nx = possible_moves[m].0;
+                                    let ny = possible_moves[m].1;
+                                    
+                                    let in_bounds = nx >= 1 && nx < map_width - 1 && ny >= 1 && ny < map_height - 1;
+                                    
+                                    if in_bounds {
+                                        let mut is_wall = false;
+                                        for w in 0..walls_cache.len() {
+                                            if walls_cache[w].0 == nx && walls_cache[w].1 == ny {
+                                                is_wall = true;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        if !is_wall {
+                                            let dist_x = ABS!(nx - ex);
+                                            let dist_y = ABS!(ny - ey);
+                                            let dist = MAX!(dist_x, dist_y);
+                                            
+                                            let mut score = -ABS!(dist - ideal_distance);
+
+                                            let dist_to_edge_x = MIN!(nx, map_width - 1 - nx);
+                                            let dist_to_edge_y = MIN!(ny, map_height - 1 - ny);
+                                            let min_dist_to_edge = MIN!(dist_to_edge_x, dist_to_edge_y);
+
+                                            if min_dist_to_edge < 12 {
+                                                score -= (12 - min_dist_to_edge) * 100; 
+                                            }
+
+                                            if score > best_score {
+                                                best_score = score;
+                                                best_move = Some((nx, ny));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(bm) = best_move {
+                                    send_command(
+                                        &mut write,
+                                        WebSocketMessage {
+                                            command: Command::Move,
+                                            args: json!({
+                                                "hero_id": hero.id,
+                                                "x": bm.0,
+                                                "y": bm.1,
+                                                "comment": comment
+                                            }),
+                                        },
+                                    ).await.unwrap();
+                                    acted = true;
+                                }
+                            }
                         } else {
-                            println!("Hero {} is blocked and waiting.", hero.id);
+                            if !acted {
+                                let path = bfs_next_step(hero.x, hero.y, map_width / 2, map_height / 2, map_width, map_height, &walls_cache);
+                                if let Some(nxt) = path {
+                                    send_command(
+                                        &mut write,
+                                        WebSocketMessage {
+                                            command: Command::Move,
+                                            args: json!({
+                                                "hero_id": hero.id,
+                                                "x": nxt.0,
+                                                "y": nxt.1,
+                                                "comment": comment
+                                            }),
+                                        },
+                                    ).await.unwrap();
+                                }
+                            }
                         }
                     }
                 }
             }
 
             Command::EndMatch => {
-                println!("MATCH ENDED!");
-                println!("Result: {:?}", message.args);
+                let reason = message.args["reason"].as_str().unwrap_or("unknown");
+                
+                if let Some(winner) = message.args["winner"].as_str() {
+                    println!("\nMATCH ENDED! Reason: {}. Winner: {}", reason, winner);
+                } else {
+                    println!("\nMATCH ENDED! Reason: {}", reason);
+                }
                 break;
             }
 
