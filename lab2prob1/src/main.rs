@@ -2,9 +2,11 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+extern crate bresenham;
+use bresenham::Bresenham;
 
 pub const PROTOCOL_VERSION: i32 = 1;
 const INT_MAX: i32 = 2147483647;
@@ -271,6 +273,9 @@ async fn main() {
     let mut map_height: i32 = 0;
     let mut walls_cache: Vec<(i32, i32)> = Vec::new();
     let mut last_known_enemies: HashMap<i32, (i32, i32)> = HashMap::new();
+    
+    let mut hero_history_1: HashMap<i32, (i32, i32)> = HashMap::new();
+    let mut hero_history_2: HashMap<i32, (i32, i32)> = HashMap::new();
 
     while let Some(msg_result) = read.next().await {
         let msg = msg_result.unwrap();
@@ -323,7 +328,7 @@ async fn main() {
                         WebSocketMessage {
                             command: Command::Challenge,
                             args: json!({
-                                "ranked": true
+                                "ranked": false
                             }),
                         },
                     ).await.unwrap();
@@ -397,6 +402,8 @@ async fn main() {
                         }
                     }
 
+                    let mut claimed_tiles: HashSet<(i32, i32)> = HashSet::new();
+
                     for i in 0..my_heroes.len() {
                         let hero = &my_heroes[i];
                         let mut acted: bool = false;
@@ -411,13 +418,8 @@ async fn main() {
                                 let mut hit_wall = false;
                                 
                                 for p in 0..line.len() {
-                                    for w in 0..walls_cache.len() {
-                                        if walls_cache[w].0 == line[p].0 && walls_cache[w].1 == line[p].1 {
-                                            hit_wall = true;
-                                            break;
-                                        }
-                                    }
-                                    if hit_wall {
+                                    if walls_cache.contains(&line[p]) {
+                                        hit_wall = true;
                                         break;
                                     }
                                 }
@@ -457,16 +459,17 @@ async fn main() {
                                     
                                     let in_bounds = nx >= 1 && nx < map_width - 1 && ny >= 1 && ny < map_height - 1;
                                     
-                                    if in_bounds {
-                                        let mut is_wall = false;
-                                        for w in 0..walls_cache.len() {
-                                            if walls_cache[w].0 == nx && walls_cache[w].1 == ny {
-                                                is_wall = true;
+                                    if in_bounds && !claimed_tiles.contains(&(nx, ny)) {
+                                        let path_to_move = bresenham_line(hero.x, hero.y, nx, ny);
+                                        let mut path_blocked = false;
+                                        for p in 0..path_to_move.len() {
+                                            if walls_cache.contains(&path_to_move[p]) {
+                                                path_blocked = true;
                                                 break;
                                             }
                                         }
                                         
-                                        if !is_wall {
+                                        if !path_blocked {
                                             let dist_x = ABS!(nx - ex);
                                             let dist_y = ABS!(ny - ey);
                                             let dist = MAX!(dist_x, dist_y);
@@ -476,9 +479,24 @@ async fn main() {
                                             let dist_to_edge_x = MIN!(nx, map_width - 1 - nx);
                                             let dist_to_edge_y = MIN!(ny, map_height - 1 - ny);
                                             let min_dist_to_edge = MIN!(dist_to_edge_x, dist_to_edge_y);
-
+                                            
                                             if min_dist_to_edge < 12 {
-                                                score -= (12 - min_dist_to_edge) * 100; 
+                                                score -= (12 - min_dist_to_edge) * 80; 
+                                            }
+                                            
+                                            let h1 = hero_history_1.get(&hero.id);
+                                            let h2 = hero_history_2.get(&hero.id);
+
+                                            if let Some(&last_pos) = h1 {
+                                                if last_pos == (nx, ny) {
+                                                    score -= 50;
+                                                }
+                                            }
+
+                                            if let Some(&last_last_pos) = h2 {
+                                                if last_last_pos == (nx, ny) {
+                                                    score -= 30;
+                                                }
                                             }
 
                                             if score > best_score {
@@ -490,6 +508,12 @@ async fn main() {
                                 }
 
                                 if let Some(bm) = best_move {
+                                    if let Some(&old_move) = hero_history_1.get(&hero.id) {
+                                        hero_history_2.insert(hero.id, old_move);
+                                    }
+                                    hero_history_1.insert(hero.id, bm);
+                                    claimed_tiles.insert(bm);
+
                                     send_command(
                                         &mut write,
                                         WebSocketMessage {
@@ -509,6 +533,7 @@ async fn main() {
                             if !acted {
                                 let path = bfs_next_step(hero.x, hero.y, map_width / 2, map_height / 2, map_width, map_height, &walls_cache);
                                 if let Some(nxt) = path {
+                                    claimed_tiles.insert(nxt);
                                     send_command(
                                         &mut write,
                                         WebSocketMessage {
